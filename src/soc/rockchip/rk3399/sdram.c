@@ -91,6 +91,54 @@ static struct rk3399_ddr_cic_regs *const rk3399_ddr_cic = (void *)CIC_BASE_ADDR;
 
 #define MAX_RANKS_PER_CHANNEL	4
 
+u32 pwrup_srefresh_exit[2];
+
+static void *get_ddrc0_con(u32 channel)
+{
+	return channel ? &rk3399_grf->ddrc1_con0 : &rk3399_grf->ddrc0_con0;
+}
+
+static void pctl_start(u32 channel)
+{
+	u32 *denali_ctl = rk3399_ddr_pctl[channel]->denali_ctl;
+	u32 *denali_phy = rk3399_ddr_publ[channel]->denali_phy;
+	u32 *ddrc0_con = get_ddrc0_con(channel);
+	u32 count = 0;
+	u32 byte, tmp;
+
+	write32(&ddrc0_con, 0x01000000);
+
+	clrsetbits32(&denali_phy[957], 0x3 << 24, 0x2 << 24);
+
+	while (!(read32(&denali_ctl[203]) & (1 << 3))) {
+		if (count > 1000) {
+			printk(BIOS_ERR, "Failed to init pctl for channel %d\n",
+			       channel);
+			while (1)
+				;
+		}
+
+		udelay(1);
+		count++;
+	}
+
+	write32(&ddrc0_con, 0x01000100);
+
+	for (byte = 0; byte < 4; byte++) {
+		tmp = 0x820;
+		write32(&denali_phy[53 + (128 * byte)], (tmp << 16) | tmp);
+		write32(&denali_phy[54 + (128 * byte)], (tmp << 16) | tmp);
+		write32(&denali_phy[55 + (128 * byte)], (tmp << 16) | tmp);
+		write32(&denali_phy[56 + (128 * byte)], (tmp << 16) | tmp);
+		write32(&denali_phy[57 + (128 * byte)], (tmp << 16) | tmp);
+
+		clrsetbits32(&denali_phy[58 + (128 * byte)], 0xffff, tmp);
+	}
+
+	clrsetbits32(&denali_ctl[68], PWRUP_SREFRESH_EXIT,
+		     pwrup_srefresh_exit[channel]);
+}
+
 static void copy_to_reg(u32 *dest, const u32 *src, u32 n)
 {
 	int i;
@@ -486,8 +534,6 @@ static int pctl_cfg(u32 channel, const struct rk3399_sdram_params *params)
 	const u32 *params_ctl = params->pctl_regs.denali_ctl;
 	const u32 *params_phy = params->phy_regs.denali_phy;
 	u32 tmp, tmp1, tmp2;
-	u32 pwrup_srefresh_exit;
-	struct stopwatch sw;
 
 	/*
 	 * work around controller bug:
@@ -505,7 +551,7 @@ static int pctl_cfg(u32 channel, const struct rk3399_sdram_params *params)
 	write32(&denali_phy[911], params->phy_regs.denali_phy[911]);
 	write32(&denali_phy[912], params->phy_regs.denali_phy[912]);
 
-	pwrup_srefresh_exit = read32(&denali_ctl[68]) & PWRUP_SREFRESH_EXIT;
+	pwrup_srefresh_exit[channel] = read32(&denali_ctl[68]) & PWRUP_SREFRESH_EXIT;
 	clrbits32(&denali_ctl[68], PWRUP_SREFRESH_EXIT);
 
 	/* PHY_DLL_RST_EN */
@@ -563,18 +609,6 @@ static int pctl_cfg(u32 channel, const struct rk3399_sdram_params *params)
 
 	phy_io_config(channel, params);
 
-	/* PHY_DLL_RST_EN */
-	clrsetbits32(&denali_phy[957], 0x3 << 24, 0x2 << 24);
-
-	/* FIXME: need to care ERROR bit */
-	stopwatch_init_msecs_expire(&sw, 100);
-	while (!(read32(&denali_ctl[203]) & (1 << 3))) {
-		if (stopwatch_expired(&sw))
-			return -1;
-	}
-
-	clrsetbits32(&denali_ctl[68], PWRUP_SREFRESH_EXIT,
-		     pwrup_srefresh_exit);
 	return 0;
 }
 
@@ -1137,6 +1171,9 @@ void sdram_init(const struct rk3399_sdram_params *params)
 			printk(BIOS_ERR, "pctl_cfg fail, reset\n");
 			board_reset();
 		}
+
+		/* start to trigger intitialization */
+		pctl_start(channel);
 
 		/* LPDDR2/LPDDR3 need to wait DAI complete, max 10us */
 		if (dramtype == LPDDR3)

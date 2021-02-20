@@ -944,7 +944,6 @@ static int data_training_wdql(u32 channel, const struct rk3399_sdram_params *par
 	return 0;
 }
 
-
 static int data_training(u32 channel, const struct rk3399_sdram_params *params,
 			 u32 training_flag)
 {
@@ -1212,11 +1211,47 @@ static unsigned char calculate_stride(struct rk3399_sdram_params *params)
 	return stride;
 }
 
+static void clear_channel_params(struct rk3399_sdram_params *params, u8 channel)
+{
+	params->ch[channel].rank = 0;
+	params->ch[channel].col = 0;
+	params->ch[channel].bk = 0;
+	params->ch[channel].bw = 32;
+	params->ch[channel].dbw = 32;
+	params->ch[channel].row_3_4 = 0;
+	params->ch[channel].cs0_row = 0;
+	params->ch[channel].cs1_row = 0;
+	params->ch[channel].ddrconfig = 0;
+}
+
+static int pctl_init(struct rk3399_sdram_params *params)
+{
+	int channel;
+	int ret;
+
+	for (channel = 0; channel < 2; channel++) {
+		phy_pctrl_reset(channel);
+		phy_dll_bypass_set(rk3399_ddr_publ[channel], params->ddr_freq);
+
+		ret = pctl_cfg(channel, params);
+		if (ret < 0) {
+			printk(BIOS_ERR, "pctl config failed\n");
+			return ret;
+		}
+
+		/* start to trigger initialization */
+		pctl_start(channel);
+	}
+
+	return 0;
+}
+
 void sdram_init(struct rk3399_sdram_params *params)
 {
 	unsigned char dramtype = params->dramtype;
 	unsigned int ddr_freq = params->ddr_freq;
-	int channel;
+	u32 training_flag = PI_READ_GATE_TRAINING;
+	int channel, ch, rank, ret;
 
 	printk(BIOS_INFO, "Starting SDRAM initialization...\n");
 
@@ -1225,39 +1260,69 @@ void sdram_init(struct rk3399_sdram_params *params)
 	    (dramtype == LPDDR4 && ddr_freq > 800*MHz))
 		die("SDRAM frequency is to high!");
 
-	rkclk_configure_ddr(ddr_freq);
+	for (ch = 0; ch < 2; ch++) {
+		params->ch[ch].rank = 2;
+		for (rank = 2; rank != 0; rank--) {
+			ret = pctl_init(params);
+			if (ret < 0) {
+				printk(BIOS_ERR, "pctl init failed\n");
+				return;
+			}
 
+			/* LPDDR2/LPDDR3 need to wait DAI complete, max 10us */
+			if (dramtype == LPDDR3)
+				udelay(10);
+
+			params->ch[ch].rank = rank;
+
+			/*
+			 * LPDDR3 CA training msut be trigger before
+			 * other training.
+			 * DDR3 is not have CA training.
+			 */
+			if (dramtype == LPDDR3)
+				training_flag |= PI_CA_TRAINING;
+
+			if (!(data_training(ch, params,
+					    training_flag)))
+				break;
+		}
+		/* Computed rank with associated channel number */
+		params->ch[ch].rank = rank;
+	}
+
+	params->num_channels = 0;
 	for (channel = 0; channel < 2; channel++) {
-		phy_pctrl_reset(channel);
-		phy_dll_bypass_set(rk3399_ddr_publ[channel], ddr_freq);
+		training_flag = PI_FULL_TRAINING;
 
-		if (channel >= params->num_channels)
+		if (!params->ch[channel].rank) {
+			clear_channel_params(params, channel);
 			continue;
-
-		/*
-		 * TODO: we need to find the root cause why this
-		 * step may fail, before that, we just reset the
-		 * system, and start again.
-		 */
-		if (pctl_cfg(channel, params) != 0) {
-			printk(BIOS_ERR, "pctl_cfg fail, reset\n");
-			board_reset();
+		} else {
+			params->num_channels++;
 		}
 
-		/* start to trigger intitialization */
-		pctl_start(channel);
+		printk(BIOS_INFO, "Channel %d", channel);
 
-		/* LPDDR2/LPDDR3 need to wait DAI complete, max 10us */
+		/* LPDDR3 should have write and read gate training */
 		if (dramtype == LPDDR3)
-			udelay(10);
-
-		if (data_training(channel, params, PI_FULL_TRAINING)) {
-			printk(BIOS_ERR, "SDRAM initialization failed, reset\n");
-			board_reset();
+			training_flag = PI_WRITE_LEVELING |
+					PI_READ_GATE_TRAINING;
+		if (dramtype != LPDDR4) {
+			ret = data_training(channel, params, training_flag);
+			if (!ret) {
+				printk(BIOS_ERR, "Data training failed for channel %d\n", channel);
+				continue;
+			}
 		}
 
 		set_ddrconfig(params, channel, params->ch[channel].ddrconfig);
 	}
+
+	if (!params->num_channels) {
+		printk(BIOS_ERR, "%d MHz failed\n", params->ddr_freq);
+	}
+
 	params->stride = calculate_stride(params);
 	dram_all_config(params);
 	switch_to_phy_index1(params);

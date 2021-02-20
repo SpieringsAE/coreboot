@@ -179,7 +179,7 @@ struct rk3399_sdram_params {
 #define PI_WDQ_LEVELING	(1 << 4)
 #define PI_FULL_TRAINING	(0xff)
 
-void sdram_init(const struct rk3399_sdram_params *sdram_params);
+void sdram_init(struct rk3399_sdram_params *sdram_params);
 u32 sdram_get_ram_code(void);
 const struct rk3399_sdram_params *get_sdram_config(void);
 size_t sdram_size_mb(void);
